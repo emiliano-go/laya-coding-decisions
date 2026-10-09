@@ -95,53 +95,69 @@ python scripts/publish.py --repo emiliano-go/laya-coding-decisions --checkpoint 
 
 Dry-run by default; `--yes` uploads.
 
-## Background and plan
+## Why we train Laya this way
 
-### Why this exists
+### What we are doing with Laya
 
-The starting problem is slop: a coding agent produces output that looks plausible but is wrong, and nothing automatically catches it.
+Laya is a small local decision model: a ModernBERT encoder (about 421M parameters) with typed decision heads that answer questions in three shapes (noul, score, choice). It is non-generative: it does not write prose, it returns a distribution over answer options plus a confidence. That matters here because the judge runs on every finished agent turn: a generative model judge would be slow, cost tokens per call, and vary run to run; Laya is local, deterministic enough to gate on, and answers in tens of milliseconds.
 
-Two capabilities fight it. A decision engine scores every finished agent turn with a small local classifier (a Laya model); if the turn does not clear the bar the engine injects review feedback and the agent retries. A deterministic verify lane always catches hard failures independent of the model: hardcoded secrets, SQL or shell injection, destructive commands, and failing tests or typechecks. Totem memory stores durable decisions, gotchas, invariants, and constraints so an agent keeps hard-won knowledge across sessions.
+We are specializing it from a general decision model into a coding judge. Given a task and the patch an agent produced, it answers two questions:
 
-The weak link is the classifier. A general Laya checkpoint ("out-multi") scores a coding turn without coding-specific training, so this repository exists to specialize Laya into a coding judge. It is the second of two shipping repos:
+- `requirements_met` (noul): does the change do what the task asked, including edge cases.
+- `bug_risk` (score, 0 to 3): does the change introduce a bug or miss an edge case.
 
-- `emiliano-go/hestia`: the product (web cockpit, reachable over a VPN, Python FastAPI plus React) with the encoder features migrated in; the encoder TUI was dropped.
-- `emiliano-go/laya-coding-decisions`: this training kit.
+The product (encoder, and now hestia) posts a strict turn state to the judge at `POST /v1/systemone`; the judge returns typed answers; the client vetoes or flags the turn and feeds corrections back. The judge is the part that cannot be hand-written, so we train it.
 
-They connect at runtime over HTTP: the product posts a turn state to the judge at `POST /v1/systemone`, and the judge returns typed answers.
+### Why memory is part of the training, not just the prompt
 
-### The plan
+The judge sees only a bounded window of the turn (512 tokens): the task, a short answer, and the diffs. That is often not enough to decide correctness. The requirement may be an invariant, a constraint, or a repo gotcha that is not visible in the diff. Totem memory holds exactly those durable facts, so the runtime feeds ranked project memory into the judge state as an authority signal.
 
-Product migration (done): decision engine, editing core with write grades, snapshots and a `/tmp` sandbox, session compaction and reminders, AGENTS.md hierarchy, provider key pools and small-model, memory auto-registration and export/import, and a registry migration to Turso.
+The catch is that the base checkpoint was never trained with that memory field, so at runtime memory is out of distribution and effectively inert. Training with memory is what makes it usable: it teaches the model to read the memory and weigh it against the patch.
 
-Training (this repo): build the dataset, fine-tune, evaluate, serve, publish. The model program tracks M1 (veto, log-odds pooling, default-deny, verify lane), M2 (real diffs, execution evidence, grounding), M3 (harness labels and diagnostics), M5 (retrain), and the v4 label fix that decouples `requirements_met` from `bug_risk`.
+The training also has to prevent a shortcut. If memory correlated with the label, the model would learn the correlation instead of reading the patch (this is exactly what happened earlier with a synthesized "execution evidence" field, and the funnel collapsed). So memory in the dataset is derived from the task only, never from whether the patch is correct:
 
-Gates: judge-dev (requirements balanced accuracy at least 0.80 and AUC at least 0.75; `bug_risk` exact at least 0.60 and MAE at most 0.70; ECE at most 0.15) and the offline funnel bench (catch at least 13 of 14, false pass at most 1 of 14).
+- it is a requirement restatement plus a task independent gotcha, chosen by task hash;
+- the same task gets the same memory on its correct, perturbed, and wrong task rows;
+- about one in five rows carries empty memory, so "memory present" never predicts a label.
 
-### Expected results
+The verdict is also written back onto the memories the turn produced, so memory is rated by outcomes. The loop is: the agent writes memory; the judge reads it; the verdict updates it; later turns get better context.
 
-| checkpoint | funnel catch | false pass | requirements bal | bug_risk exact |
-|---|---|---|---|---|
-| out-multi (base) | 12/14 | 2/14 | 0.783 | 0.011 |
-| out-m5c (v4 full fine-tune) | 10/14 | 4/14 | 0.760 | 0.469 |
-| out-m5c-head (head-only, in flight) | target at least 12/14 | target at most 2/14 | target at least 0.78 | target at least 0.60 |
+Totem specifics: the product uses the real `totem_mcp` package (schema v9, with verification records), one database per clone at `<clone>/.totem/totem.db`. An earlier encoder integration used a TypeScript Totem port that lagged at schema v3; the merge removes that drift. File writes also auto-register implementation memories through Totem's locator dedup, and the memory writer distills prose on the small model. Totem's verification layer (verified date, verified commit) is deferred as a future trust signal.
 
-Success: the head-only run preserves the base checkpoint's reasoning heads while adapting the bug-risk head; if it beats the base on the funnel without losing requirements accuracy it becomes the candidate judge, then the memory-aware run follows, weights are published, and the model is registered in Laya.
+### Why this dataset
 
-Fallback: keep the base checkpoint as the judge and lean on the deterministic verify lane, calibration, and a real harness-label flywheel (labels from actual task outcomes instead of the synthetic dataset). The failed full fine-tunes already showed the synthetic dataset alone is not enough.
+We need many labeled examples of "task plus patch is correct" and "task plus patch is buggy", with the two axes expressed independently. Real agent trajectories do not give that cleanly, so the dataset is synthesized from public sources:
 
-What we learned (also in `RESULTS.md`): full fine-tuning from the base checkpoint degrades the funnel every time; decoupling the labels did not recover it; improving `bug_risk` exact did not improve the funnel. The funnel is driven mostly by `requirements_met` plus the verify lane.
+- resolved labeled agent trajectories (SWE-smith, SWE-rebench), which give real tasks, real patches, and a resolution signal for `requirements_met`;
+- gold patch instances (SWE-Gym, SWE-smith), known correct patches;
+- BigCodeBench, function level canonical versus deterministic mutants, giving correct versus buggy pairs at small granularity.
 
-### Relation to Totem
+We then add the hard negatives the judge must learn to separate:
 
-Totem is the memory layer and it is central, not an add-on.
+- perturbed: a correct patch with a rule guided bug injected, so `requirements_met=1` but `bug_risk=3`; this is the "looks right but is buggy" class the funnel exists to catch;
+- cross-instance: a different task's correct patch, so `requirements_met=0` and `bug_risk=0`; this is the "unrelated changes" class.
 
-- Storage: the product uses the real `totem_mcp` Python package (schema v9 with verification records), one database per project clone at `<clone>/.totem/totem.db` plus a user database. An earlier encoder integration used a TypeScript Totem port that lagged at schema v3; the merge removes that drift.
-- Judge input: before scoring, the decision engine reads ranked project memory (matched by task and changed path) into the judge state, so memory gives the judge authority the diff alone cannot, such as an invariant or constraint the change violates.
-- Judge output: after a verdict the engine writes the decision back onto the memories the turn produced (`metadata.decision`), so memory is rated by outcomes.
-- File changes: writing, editing, or patching a file auto-registers an implementation memory through Totem's locator dedup (`register_file_write`).
-- Distillation: the memory writer runs on the small model.
+The label structure is deliberately decoupled. Earlier versions tied `bug_risk` to `requirements_met` (buggy only when the wrong task), which made the two heads redundant and the model degenerate to near constant outputs. The fixed dataset keeps four combinations, so `bug_risk` carries information that is independent of `requirements_met`.
 
-The symbiosis is a loop: the agent writes memory; the decision engine reads memory to judge the turn; the verdict is written back to memory; future turns get better context from better-rated memories.
+Two more choices: the split is grouped by task hash (train, dev, test) to avoid leakage between splits, and a slice of dev is held out specifically for memory ablation, rows where the gold hinges on reading the memory.
 
-Deferred: Totem's verification layer (`verified_at`, `verified_commit`, a context boost for fresh verifications) could give the judge a first-class trust signal, but the current training carries plain memory only (`id`, `type`, `title`, `statement`).
+The honest limitation: synthetic labels are not the real outcome distribution, so the fallback, if training stalls, is a harness-label flywheel that draws labels from actual task outcomes instead.
+
+### Why this training method
+
+The method is Laya's own typed-decisions recipe, adapted to one GPU.
+
+- Start from an existing checkpoint, not from scratch. The base already knows the decision protocol and has reasoning heads; we are adapting it, not rebuilding it.
+- Objective: contrastive reinforcement (RLCD) with proper scoring rewards plus a soft cross-entropy term. The judge emits a distribution over levels, and proper scoring rules (spherical and ranked probability score) reward a calibrated distribution rather than just the argmax; the soft cross-entropy keeps the head anchored to the target distribution. The RL part samples noisy logits, scores them with the proper reward, normalizes the advantage (GRPO style), and takes a policy-gradient step; the cross-entropy is added alongside it.
+- Efficiency: length bucketed batching, a tokenized item cache, bf16 autocast, gradient checkpointing, 8-bit AdamW, cosine schedule, gradient clipping. It fits a 7.65 GB card; the full run is about 9 hours, a head-only run about 3.
+- Fine-tuning strategy: full versus head-only. Full fine-tuning from the base checkpoint degrades the funnel: every full run lost catch and forgot the reasoning heads. Head-only freezes the encoder so the base reasoning is preserved while the heads adapt to the new labels. That is the current experiment.
+- Calibration after training: temperature scaling per question type, plus runtime per-question Platt or isotonic calibration and a conformal threshold, because the funnel cares about calibrated confidence, not just the predicted level.
+
+### What good looks like
+
+Two gates, because the product metric is slop catch versus false pass, not raw accuracy. A model can have a better `bug_risk` exact and still a worse funnel (we measured that), so the funnel is the gate that matters.
+
+- judge-dev: `requirements_met` balanced accuracy at least 0.80 and AUC at least 0.75; `bug_risk` exact at least 0.60 and MAE at most 0.70; ECE at most 0.15.
+- funnel bench: catch at least 13 of 14 known bad cases and at most 1 false pass.
+
+Measured so far: the base checkpoint catches 12 of 14 with 2 false passes; the v4 full fine-tune catches 10 of 14 with 4 false passes (worse), even though its `bug_risk` exact rose from 0.011 to 0.469. That gap is the reason the project is now on a head-only run. Details in `RESULTS.md`.
