@@ -160,4 +160,4 @@ Two gates, because the product metric is slop catch versus false pass, not raw a
 - judge-dev: `requirements_met` balanced accuracy at least 0.80 and AUC at least 0.75; `bug_risk` exact at least 0.60 and MAE at most 0.70; ECE at most 0.15.
 - funnel bench: catch at least 13 of 14 known bad cases and at most 1 false pass.
 
-Measured so far: the base checkpoint catches 12 of 14 with 2 false passes; the v4 full fine-tune catches 10 of 14 with 4 false passes (worse), even though its `bug_risk` exact rose from 0.011 to 0.469. That gap is the reason the project is now on a head-only run. Details in `RESULTS.md`.
+Measured: the base checkpoint catches 12 of 14 with 2 false passes; the v4 full fine-tune catches 10 of 14 (worse) even though its `bug_risk` exact rose from 0.011 to 0.469; head-only, a longer context window, and a third `no_unrelated_changes` question each failed to beat the base. The base remains the production judge. Details and the next lever (execution-verified labels plus a preference objective and distillation) are in `RESULTS.md`.
