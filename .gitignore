@@ -1,0 +1,17 @@
+# Data (built by the scripts; never commit)
+/data/
+*.jsonl
+*.pt
+*.safetensors
+out-*/
+checkpoint*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

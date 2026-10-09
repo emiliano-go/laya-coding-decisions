@@ -1,0 +1,22 @@
+[project]
+name = "laya-coding-decisions"
+version = "0.1.0"
+description = "Train Laya into a coding-agent judge for the encoder/hestia decision engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "laya",
+    "torch",
+    "transformers",
+    "safetensors",
+    "huggingface_hub",
+    "bitsandbytes",
+    "datasets",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "F401", "F811"]

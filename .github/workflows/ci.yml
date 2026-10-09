@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check scripts/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+      - name: Compile
+        run: python -m compileall -q scripts/
+      - name: Dataset smoke test (no GPU, stdlib only)
+        run: python scripts/smoke_test.py
