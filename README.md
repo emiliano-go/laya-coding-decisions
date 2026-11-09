@@ -4,9 +4,13 @@ Train **Laya** into a judge for coding-agent turns: given a task and a patch,
 score `requirements_met` and `bug_risk`. Built for the encoder / hestia decision
 engine, which posts a strict state to `POST /v1/systemone`.
 
-> **Status:** research recipe. The published weights are not ready yet; the
-> current best judge is still the base `convaiinnovations/laya` ("out-multi").
-> See `RESULTS.md`.
+> **Status (2026-11):** research recipe; published weights are not ready. Two
+> results frame the work: (1) the original `gold` cache was mislabeled
+> (SWE-smith's `patch` is the *breaking* patch), now rebuilt as `gold_fixed`;
+> (2) no trained judge beats the base `convaiinnovations/laya` on the
+> out-of-distribution funnel, and a model trained to read memory invariants does
+> not learn the task. The reliable gains are a deterministic verify lane plus a
+> calibrated decision rule. See `RESULTS.md`.
 
 ## Layout
 
@@ -18,6 +22,12 @@ scripts/
   eval_dec.py                        judge-dev metrics: balanced acc, AUC, ECE, MAE
   smoke_test.py                      stdlib-only invariant check for the builder
   publish.py                         upload a checkpoint to the Hugging Face Hub
+  gen_deepseek.py                    teacher-generated bug/scope/answer/memory rows
+  build_final.py                     combine base + teacher + memory rows
+  reorder_state.py                   rewrite states to the serving key order
+  select_swe_tasks.py                pick SWE-smith instances for the agent funnel
+  select_swe_tasks_hard.py           harder, scorable SWE-smith selection
+  run_swe_smith.py                   run the agent ON/OFF on SWE-smith, hidden tests
 ```
 
 ## Install
@@ -34,7 +44,11 @@ First build the source cache (needs network + `datasets`):
 LAYACD_DATA=/data/laya-ft python scripts/fetch_dec.py
 ```
 
-`gen_dataset_v2.py` consumes `$LAYACD_DATA/cache3/{swe_smith_traj,swe_rebench_traj,gold,bigcodebench}.jsonl`
+> **Label bug (fixed 2026-11):** SWE-smith's `patch` is the *breaking* patch, not
+> the fix. The old cache labelled ~17.5k of them `correct=True`.
+> `gold_fixed.jsonl` keeps SWE-Gym as correct and SWE-smith as a negative; use it.
+
+`gen_dataset_v2.py` consumes `$LAYACD_DATA/cache3/{swe_smith_traj,swe_rebench_traj,gold_fixed,bigcodebench}.jsonl`
 (each row: `task`, `diff`, `correct`, `extra`) and writes
 `$LAYACD_DATA/{train,dev,test}_m5d.jsonl` (`LAYACD_DATA` defaults to `/data/laya-ft`).
 Each row is `{id, state, questions, gold}` where `state = {task, memory, answer,
@@ -122,7 +136,31 @@ The training also has to prevent a shortcut. If memory correlated with the label
 
 The verdict is also written back onto the memories the turn produced, so memory is rated by outcomes. The loop is: the agent writes memory; the judge reads it; the verdict updates it; later turns get better context.
 
-Totem specifics: the product uses the real `totem_mcp` package (schema v9, with verification records), one database per clone at `<clone>/.totem/totem.db`. An earlier encoder integration used a TypeScript Totem port that lagged at schema v3; the merge removes that drift. File writes also auto-register implementation memories through Totem's locator dedup, and the memory writer distills prose on the small model. Totem's verification layer (verified date, verified commit) is deferred as a future trust signal.
+Totem specifics: the product uses the real `totem_mcp` package (schema v9, with verification records), one database per clone at `<clone>/.totem/totem.db`. An earlier encoder integration used a TypeScript Totem port that lagged at schema v3; the merge removes that drift. File writes also auto-register implementation memories through Totem's locator dedup, and the memory writer distills prose on the small model.
+
+**Update (2026-11):** the model-based memory experiment did not work. Training with memory fixed the semantics (a violated invariant is caught, a respected one passes) but cost real catches, and a dedicated `(invariant, patch)` classifier did not separate honored from violated patches (head-only ~0.41 for both; full fine-tune collapsed to a constant; hunk-delta was weak). Enforcement now uses Totem's runnable `verificationMethod`, not the judge's reading of memory prose.
+
+### State layout, budget, and step-level checks
+
+The judge sees a serialized state, and laya keeps the *head* of it. The original
+order (`task, memory, answer, changes`) let a normal-length answer push the patch
+out of the 512-token window, so on real turns the judge often never saw the diff.
+The runtime now serializes `task, memory, changes, answer, toolCalls, grounding`,
+caps the answer short, and trains/serves at 1024 tokens. The generators use the
+same key order (`reorder_state.py`), so training and serving match.
+
+`stepChecks` (`off | veto | full`) and `stepCadence` (`turn | tool | both`) let the
+runtime call laya mid-run, after each mutating turn or tool, not only at the
+terminal gate. Calls are unlimited (~23 ms each); correction messages are
+budgeted. On tasks the baseline already solves, step checks add coverage but no
+outcome gain, and many intermediate states flag "fail" and later pass; `veto` is
+the sane default, `full` is noisy and slower.
+
+Memory enforcement is deterministic: a Totem invariant may carry
+`metadata.verificationMethod = {run, cwd, timeout_s, appliesTo}`; the lane runs
+it for matching changed paths, vetoes on failure, and stamps verification on
+success. `totem lint` reports invariants without a runnable check. This replaces
+the model-based invariant stage, which did not learn the task (see `RESULTS.md`).
 
 ### Why this dataset
 
@@ -160,4 +198,10 @@ Two gates, because the product metric is slop catch versus false pass, not raw a
 - judge-dev: `requirements_met` balanced accuracy at least 0.80 and AUC at least 0.75; `bug_risk` exact at least 0.60 and MAE at most 0.70; ECE at most 0.15.
 - funnel bench: catch at least 13 of 14 known bad cases and at most 1 false pass.
 
-Measured: the base checkpoint catches 12 of 14 with 2 false passes; the v4 full fine-tune catches 10 of 14 (worse) even though its `bug_risk` exact rose from 0.011 to 0.469; head-only, a longer context window, and a third `no_unrelated_changes` question each failed to beat the base. The base remains the production judge. Details and the next lever (execution-verified labels plus a preference objective and distillation) are in `RESULTS.md`.
+Measured: the base checkpoint catches 12 of 14 with 2 false passes on the
+original bench. On the current 33-case bench the base plus the deterministic lane
+catches 21/22 with 1 false pass; `out-m5mem4-head` at pass 0.65 is 22/22 with 0
+false passes and 4/11 false alarms. Every trained model still trails the base on
+the out-of-distribution funnel on its own, so the lane and the calibrated
+threshold are what ship. The memory model is rejected, and step-level checks are
+still being measured (no outcome gain yet). Details are in `RESULTS.md`.

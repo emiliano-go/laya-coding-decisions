@@ -1,5 +1,61 @@
 # Results
 
+## 2026-11 update
+
+### Corrected labels (major data bug)
+The original `gold.jsonl` mixed SWE-Gym fix patches with **SWE-smith breaking
+patches**: SWE-smith's `patch` field is the bug-*injection*, not the fix, so
+~17.5k buggy patches were labelled `correct=True`. The cache is rebuilt as
+`gold_fixed.jsonl` (SWE-Gym = correct, SWE-smith = a high-quality negative), and
+`fetch_dec.py` now labels them correctly. `gen_dataset_v2.py` consumes the fixed
+cache (`train_m5f`).
+
+### Trained judges (all start from `out-multi` unless noted)
+| checkpoint | setup | dev result | OOD funnel |
+|---|---|---|---|
+| out-m5f-head | corrected labels (m5f), head-only, 512 | bug_risk exact 0.008 -> **0.346**, MAE 1.46 -> **1.09**; req AUC 0.635 -> **0.830**; no_unrelated AUC 0.392 -> **0.778** | **10/14** caught (no transfer) |
+| out-m5final-head | m5f + teacher bug/scope + answer-quality data | separation gap 0.06 -> **0.16**; `answer-good` fixed | 22/22, 0 FP, FA 5/11 |
+| out-m5mem-head | memory-conditional (8x) | memory semantics correct, but lost 4 catches | 18/22, 4 FP |
+| out-m5mem2-head | memory-conditional (3x) | memory semantics correct, lost 3 catches | 19/22, 3 FP |
+| out-m5mem4-head | new layout (diff before answer), 1024, counterfactual memory | best deployable checkpoint | **22/22, 0 FP, FA 4/11** (pass 0.65) |
+
+Conclusions: the label fix improves in-distribution discrimination but **does
+not transfer OOD**; memory-conditional training fixes invariant semantics but
+costs real catches; the model itself never beats the base on the OOD funnel.
+
+### Model-based memory invariants: rejected
+A dedicated `(invariant, patch) -> honors_invariant` stage was trained three
+ways. Head-only on the full diff: ~0.41 for both honored and violating patches
+(no separation). Full fine-tune: collapsed to a constant ~0.18. Hunk-delta
+input: ~0.40 vs ~0.29, overlapping. The 421M encoder cannot learn invariant
+consistency from these data. **Memory enforcement moved to Totem's runnable
+`verificationMethod` (`run` + `appliesTo`), executed by the deterministic lane.**
+
+### Deterministic lane is the reliable lever
+Added, all tested: diff-aware scanning (secrets/deserialization were missed when
+only the tool-input summary was scanned), assignment-in-condition, silent
+swallow, unsafe deserialization, test-weakening, and answer-text safety. Also
+runnable memory invariants (Totem `verificationMethod.run`, `appliesTo` globs)
+and verification stamping on success. Offline bench (33 cases):
+
+| judge + lane | caught | false pass | false alarm |
+|---|---|---|---|
+| out-multi (base) | 21/22 | 1/22 | 6/11 |
+| out-m5final-head | 22/22 | 0/22 | 5/11 |
+| out-m5mem4-head (pass 0.65) | **22/22** | **0/22** | **4/11** |
+
+### Step-level checks (in progress)
+`stepChecks: off | veto | full`, `stepCadence: turn | tool | both`; laya is
+called per mutating turn/tool (~23 ms, unlimited), feedback is budgeted. On a
+hard SWE-smith set (20 instances, DeepSeek v4.1 flash): the baseline passes
+almost everything; step calls 39-48/run; 21-36% of step evaluations flag
+intermediate states that later pass; `full` costs ~+47% runtime with 2/6
+timeouts; **no outcome improvement measured yet**. The only apparent failure was
+a harness bug (scoring a Go repo with `python`). Headroom requires harder tasks
+or a weaker model.
+
+## Earlier results (v1-v2)
+
 Every run below starts from the base `convaiinnovations/laya` ("out-multi") and
 is judged on `dev_m5d` (corrected labels) and the offline funnel bench
 (`encoder` `decision-bench.ts`, tuned 2-question set). The base is the control.
