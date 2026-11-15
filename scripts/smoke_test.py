@@ -7,12 +7,15 @@ from the task alone (never the label), and `requirements_met` / `bug_risk` are
 decoupled.
 """
 
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import gen_dataset_v2 as g  # noqa: E402
+import gen_dataset_v6 as v6  # noqa: E402
+from normalize_state import normalize_state  # noqa: E402
 
 
 def main() -> None:
@@ -35,6 +38,20 @@ def main() -> None:
 
     empties = sum(1 for i in range(500) if not g.derive_memories(f"task {i}"))
     assert 50 < empties < 150, f"expected ~20% empty-memory rows, got {empties}/500"
+
+    # v6: canonical layout and three-head labels.
+    row = v6.make_row(task, "+ a\n- b\n", True, 0, "none", source="smoke")
+    assert row is not None
+    state = row["state"]
+    assert list(state.keys()) == ["task", "memory", "changes", "answer", "toolCalls", "grounding"]
+    assert len(state["task"]) <= 400 and len(state["answer"]) <= 200
+    gold = json.loads(row["gold"]) if isinstance(row["gold"], str) else row["gold"]
+    assert set(gold) == {"requirements_met", "bug_risk", "bug_class"}
+    assert gold["bug_class"]["label"] == list(v6.BUG_CLASS).index("none")
+
+    normalized = normalize_state(task="x" * 900, answer="y" * 900)
+    assert normalized["task"].endswith("…[truncated]")
+    assert len(normalized["answer"]) <= 220
 
     print("coding-decisions dataset smoke: OK")
 

@@ -160,7 +160,9 @@ def main():
     sources = {
         "swe_smith_traj": load_cache("swe_smith_traj"),
         "swe_rebench_traj": load_cache("swe_rebench_traj"),
-        "gold": load_cache("gold"),
+        # SWE-smith's `patch` is the breaking patch; only gold_fixed carries
+        # corrected labels (see README "Label bug").
+        "gold": load_cache("gold_fixed"),
         "bigcodebench": load_cache("bigcodebench"),
     }
     rows = []

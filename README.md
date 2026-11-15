@@ -65,6 +65,70 @@ Hard-negatives that make the judge useful:
 task-independent gotcha, chosen by task hash), so memory never predicts the
 label; ~20% of rows carry `memory: []`. `smoke_test.py` asserts these invariants.
 
+## v6 data (2026-11)
+
+`scripts/gen_dataset_v6.py` rebuilds the decision set around execution-verified
+sources and one canonical state layout:
+
+- `scripts/normalize_state.py` mirrors dsh-totem `src/laya.ts` exactly (key order
+  `task, memory, changes, answer, toolCalls, grounding`, 400/4000/2000/200/10/2
+  caps). Train, eval, and serve must use it.
+- Positives from `nebius/SWE-bench-extra` and `R2E-Gym-Lite` (dataset/execution
+  verified), plus `mattymchen/codejudgebench` correct/incorrect pairs for
+  `requirements_met` and `bug_class`.
+- Perturbed verified patches and cross-instance negatives keep the hard-negative
+  classes; memory stays task-hash derived so it never predicts the label.
+- `codejudgebench-adversarial` is written to `hard_ood_m6.jsonl` and is never
+  trained.
+- `bug_class` gold comes only from source error metadata; rows where it cannot be
+  inferred keep `bug_risk` and `requirements_met` only.
+
+```sh
+python scripts/gen_dataset_v6.py --offline   # base m5f + local cache
+python scripts/gen_dataset_v6.py             # stream the public sources
+```
+
+Outputs `{train,dev,test}_m6.jsonl`; `train_coding.py --label-smoothing 0.05`
+uses the three-head set. Head-only is still the default experiment.
+
+## v7 labels (2026-11-15)
+
+`scripts/gen_dataset_v7.py` turns the v6 base into a four-head decision set:
+
+- **`no_unrelated_changes` is a real question** (not just a gold field), so
+  scope has its own head in training and the bench.
+- **Balanced `bug_class`**: teacher preference pairs contribute their
+  `dimensions.defect` as a class label (wrong-comparison, off-by-one,
+  null-empty, type-coercion, resource-leak, swallowed-exception, other), and
+  deterministic mutations fill off-by-one / wrong-comparison / type-coercion.
+  Choice items are inversely class-weighted (capped at 10x) in training.
+- **Graded `bug_risk`**: teacher rows keep severity 1/2/3 instead of only 0/3.
+- **Scope negatives**: teacher scope patches plus deterministic unrelated-file
+  hunks, labeled `requirements_met=1`, `bug_risk=0`,
+  `no_unrelated_changes=0`, `bug_class=scope-unrelated`.
+
+Outputs `{train,dev,test}_v7.jsonl`; start from `out-m5mem4-head` head-only so
+the funnel catch is protected.
+
+## Localization (2026-11-15)
+
+`scripts/localize_hunks.py` asks Laya which diff hunk contains the injected bug
+(zero-shot, no training). On 100 mutation rows it reaches top1 **0.30**, top2
+**0.68**, MRR **0.578**; the function-level probe is weaker (recall 0.333,
+top5 0.5). `scripts/build_localization.py` materializes the hunk-choice rows in
+`loc_{train,dev,test}.jsonl` (1,653 / 220 / 80).
+
+Each row now carries per-row `criteria` (`hunk-0..N`) and matching
+`gold.probabilities` keys. Without those, `train_coding.py` silently skipped
+every choice item; the earlier files were not train-ready.
+
+Manual testing is wired into dsh-totem: `POST /totem/laya/localize`
+(`{task, diff}` or `{task, changes}`) ranks hunks and returns
+`{top, hunks:[{index, header, added, score}], ms}`. It is a narrowing probe
+only: never records a decision, never steers, and works while the automatic
+gate is off when the shared server is healthy. `laya_localize` exposes the
+same call to the agent when Laya is enabled.
+
 ## Train
 
 ```sh

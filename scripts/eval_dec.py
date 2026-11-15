@@ -6,6 +6,7 @@ Reports per-question balanced accuracy, separation, and ECE for noul questions
 and MAE for score questions.
 """
 import json
+import os
 import random
 import sys
 from collections import defaultdict
@@ -15,7 +16,7 @@ import laya
 random.seed(5)
 model = sys.argv[1] if len(sys.argv) > 1 else "/data/laya-ft/out-dec"
 dev = sys.argv[2] if len(sys.argv) > 2 else "/data/laya-ft/dev_dec.jsonl"
-agent = laya.load(model, device="cuda")
+agent = laya.load(model, device=os.environ.get("LAYACD_DEVICE", "cuda"))
 print("loaded", model, flush=True)
 
 rows = [json.loads(line) for line in open(dev)]
@@ -81,6 +82,28 @@ def brier(probs, labels):
 
 def report(label, qid, cases):
     preds, golds, confs, ps = [], [], [], []
+    if qid == "bug_class":
+        keys = list(cases[0][1]["criteria"].keys())
+        correct, confs, confusion = [], [], defaultdict(int)
+        for state, qdef, g, _is_slice in cases:
+            res = agent.system_one(state, {"q": qdef})
+            ans = res["answers"]["q"]
+            want = keys[g["label"]]
+            got = ans.get("choice")
+            correct.append(got == want)
+            confs.append(ans.get("confidence", 0.5))
+            confusion[(want, got)] += 1
+        acc = sum(correct) / len(correct)
+        recalls = []
+        for key in keys:
+            total = sum(1 for (want, _got), count in confusion.items() if want == key for _ in range(count))
+            hit = sum(count for (want, got), count in confusion.items() if want == key and got == key)
+            recalls.append(hit / total if total else 0.0)
+        macro = sum(recalls) / len(recalls)
+        top = sorted(((count, want, got) for (want, got), count in confusion.items()), reverse=True)[:5]
+        detail = " ".join(f"{want}->{got}:{count}" for count, want, got in top)
+        print(f"{label:34s} n={len(cases):6d} acc={acc:.3f} macro={macro:.3f} ece={ece(confs, correct):.3f} {detail}")
+        return
     for state, qdef, g, _is_slice in cases:
         res = agent.system_one(state, {"q": qdef})
         ans = res["answers"]["q"]

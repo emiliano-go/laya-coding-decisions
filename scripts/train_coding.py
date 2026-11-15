@@ -53,6 +53,7 @@ def collate_train_batch(items, pad_id):
         "target": target,
         "qtype": torch.tensor([it["qtype"] for it in items]),
         "label": torch.tensor([it["label"] for it in items]),
+        "weight": torch.tensor([it.get("weight", 1.0) for it in items], dtype=torch.float32),
     }
 
 
@@ -71,6 +72,9 @@ def build_training_item(tok, cfg, state, q, gold_q):
         return None
     s = sum(target)
     target = [v / s for v in target] if s > 0 else [1.0 / len(target)] * len(target)
+    eps = cfg.get("label_smoothing", 0.0)
+    if eps > 0:
+        target = [(1.0 - eps) * v + eps / len(target) for v in target]
     label = target.index(max(target))
     k = len(render_options({"t": t, "crit": crit}))
     seq, markers = build_sequence(
@@ -78,7 +82,7 @@ def build_training_item(tok, cfg, state, q, gold_q):
     )
     if len(markers) != k:
         return None
-    return {"ids": seq, "markers": markers, "qtype": QTYPES[t], "target": target, "label": label}
+    return {"ids": seq, "markers": markers, "qtype": QTYPES[t], "target": target, "label": label, "weight": 1.0}
 
 
 def load_items(tok, cfg, path, cache, recache):
@@ -86,7 +90,10 @@ def load_items(tok, cfg, path, cache, recache):
         print(f"loading cached items from {cache}")
         return torch.load(cache, weights_only=False)
     items = []
-    for line in open(path):
+    print(f"tokenizing {path} ...", flush=True)
+    for index, line in enumerate(open(path)):
+        if index and index % 10000 == 0:
+            print(f"  tokenized {index} rows ({len(items)} items)", flush=True)
         row = json.loads(line)
         state = row["state"]
         if isinstance(state, str) and state.strip().startswith(("{", "[")):
@@ -101,6 +108,15 @@ def load_items(tok, cfg, path, cache, recache):
                 it = build_training_item(tok, cfg, state, q, gold[qid])
                 if it:
                     items.append(it)
+    from collections import Counter
+    choice = [it for it in items if it["qtype"] == 0]
+    if choice:
+        counts = Counter(it["label"] for it in choice)
+        total = sum(counts.values())
+        classes = len(counts)
+        for it in choice:
+            it["weight"] = min(10.0, total / (classes * counts[it["label"]]))
+        print("  choice class weights", {k: round(v, 2) for k, v in counts.items()})
     torch.save(items, cache)
     print(f"cached {len(items)} items to {cache}")
     return items
@@ -158,6 +174,7 @@ def main():
     ap.add_argument("--optim", default="8bit", help="adamw | 8bit")
     ap.add_argument("--dtype", default="bf16", help="bf16 | fp16")
     ap.add_argument("--bucket-window", type=int, default=1000)
+    ap.add_argument("--label-smoothing", type=float, default=0.0, help="blend targets with the uniform distribution")
     ap.add_argument("--no-gradient-checkpointing", action="store_true")
     ap.add_argument("--recache", action="store_true")
     args = ap.parse_args()
@@ -181,6 +198,7 @@ def main():
         cfg = json.load(f)
     cfg["max_len"] = args.max_len
     cfg["head_max_len"] = args.head_max_len
+    cfg["label_smoothing"] = args.label_smoothing
 
     cache = f"{args.data}.items.{args.max_len}.{args.head_max_len}.pt"
     all_items = load_items(tok, cfg, args.data, cache, args.recache)
@@ -279,8 +297,9 @@ def main():
                 adv = adv / (adv.std() + 1e-6)
 
             logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
-            loss_rl = -(adv * logp).mean()
-            loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
+            weight = batch["weight"].to(device)
+            loss_rl = -((adv * logp) * weight).mean()
+            loss_ce = (-(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1) * weight).mean()
             loss = (loss_rl + 1.0 * loss_ce) / args.grad_accum
 
             scaler.scale(loss).backward()

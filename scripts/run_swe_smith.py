@@ -135,14 +135,16 @@ def restore_oracle(repo, oracle_dir, moved):
             shutil.copy2(src, dst)
 
 
-def decision_config(cond, repo):
+def decision_config(cond, repo, artifact_dir=None):
     base = {
         "enabled": True,
         "baseUrl": BASE_URL,
-        "confidenceFloor": 0,
+        "confidenceFloor": 0.5,
         "passThreshold": 0.65,
         "maxFeedbackRetries": 1,
         "captureState": True,
+        "requestTimeoutMs": 30000,
+        **({"artifactDir": artifact_dir} if artifact_dir else {}),
         **CONDITIONS[cond],
     }
     os.makedirs(os.path.join(repo, ".encoder"), exist_ok=True)
@@ -165,12 +167,12 @@ def agent_problem(log_path, code):
     return None
 
 
-def agent_run(repo, prompt, timeout_min, log_path, agent=AGENT):
+def agent_run(repo, prompt, timeout_min, log_path, agent=AGENT, variant=""):
     env = {**os.environ, "PWD": repo}
     with open(log_path, "w") as log:
         try:
             proc = subprocess.run(
-                ["bun", "run", ENTRY, "run", "--auto", "--print-logs", "--log-level", "ERROR", "--model", agent, prompt],
+                ["bun", "run", ENTRY, "run", "--auto", "--print-logs", "--log-level", "ERROR", "--model", agent, *(["--variant", variant] if variant else []), prompt],
                 cwd=repo,
                 env=env,
                 stdout=log,
@@ -183,7 +185,7 @@ def agent_run(repo, prompt, timeout_min, log_path, agent=AGENT):
             return 124
 
 
-def run_pytest(image, repo, ids, timeout=900):
+def run_pytest(image, repo, ids, timeout=900, require_pass=None):
     quoted = " ".join(f"'{i}'" for i in ids)
     proc = run(
         [
@@ -192,16 +194,21 @@ def run_pytest(image, repo, ids, timeout=900):
             "-e", "PYTHONDONTWRITEBYTECODE=1",
             "-v", f"{repo}:/testbed",
             image, "bash", "-lc",
-            f"cd /testbed && python -m pytest -q -p no:cacheprovider {quoted}",
+            f"cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest -q -rA -p no:cacheprovider {quoted}",
         ],
         timeout=timeout,
     )
-    return proc.returncode == 0, proc.stdout[-6000:], proc.stderr[-800:]
+    ok = proc.returncode == 0
+    # A skipped/xfailed FAIL_TO_PASS still exits 0; require an explicit PASSED line.
+    if ok and require_pass:
+        passed = [line for line in proc.stdout.splitlines() if line.startswith("PASSED ")]
+        ok = all(any(tid in line for line in passed) for tid in require_pass)
+    return ok, proc.stdout[-6000:], proc.stderr[-800:]
 
 
 def score(image, repo, task, p2p_sample):
     ids = list(task["FAIL_TO_PASS"]) + list(task["PASS_TO_PASS"][:p2p_sample])
-    ok, out, err = run_pytest(image, repo, ids)
+    ok, out, err = run_pytest(image, repo, ids, require_pass=list(task["FAIL_TO_PASS"]))
     return ok, out[-1500:], err
 
 
@@ -232,8 +239,8 @@ def write_row(results_path, iid, task, cond, passed, skipped=None, agent_exit=No
         f.write(json.dumps(row) + "\n")
 
 
-def coverage(repo):
-    path = os.path.join(repo, ".encoder", "decision-log.jsonl")
+def coverage(repo, artifact_dir=None):
+    path = os.path.join(artifact_dir, "decision-log.jsonl") if artifact_dir else os.path.join(repo, ".encoder", "decision-log.jsonl")
     counts = {"step": 0, "mutation": 0, "answer": 0}
     if os.path.exists(path):
         for line in open(path):
@@ -252,8 +259,8 @@ def coverage(repo):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tasks", default=os.path.join(os.environ.get("LAYACD_DATA", "/data/laya-ft"), "swe-smith", "tasks.json"))
-    ap.add_argument("--root", default=os.path.join(os.environ.get("LAYACD_DATA", "/data/laya-ft"), "swe-smith"))
+    ap.add_argument("--tasks", default="/data/laya-ft/swe-smith/tasks.json")
+    ap.add_argument("--root", default="/data/laya-ft/swe-smith")
     ap.add_argument("--conditions", default="off,veto-turn")
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--skip", type=int, default=0)
@@ -261,6 +268,8 @@ def main():
     ap.add_argument("--p2p-sample", type=int, default=8)
     ap.add_argument("--remove-images", action="store_true", help="docker rmi each image after its conditions")
     ap.add_argument("--agent", default=AGENT, help="provider/model for the agent")
+    ap.add_argument("--variant", default="", help="provider variant, e.g. low")
+    ap.add_argument("--visible-tests", action="store_true", help="leave FAIL_TO_PASS tests in the repo so the agent can run them")
     ap.add_argument("--baseline-only", action="store_true", help="validate bug patch + failing F2P, do not run the agent")
     args = ap.parse_args()
 
@@ -290,6 +299,7 @@ def main():
             or task.get("baseline_ok") is None
             or not task.get("patch")
             or not task.get("patch_applied")
+            or task.get("visible_tests") != args.visible_tests
         ):
             shutil.rmtree(base, ignore_errors=True)
             export_testbed(image, os.path.join(base, "repo"))
@@ -312,8 +322,11 @@ def main():
                 elif not (task.get("problem_statement") or "").strip():
                     task["problem_statement"] = describe_failure(f2p_out)
                     print("  synthesized problem statement from baseline output", flush=True)
-            if task.get("baseline_ok"):
+            task["visible_tests"] = args.visible_tests
+            if task.get("baseline_ok") and not args.visible_tests:
                 task["oracle"] = hide_oracle(os.path.join(base, "repo"), task, os.path.join(base, "oracle"))
+            else:
+                task["oracle"] = []
             with open(task_path, "w") as f:
                 json.dump(task, f, indent=2)
             if not task.get("baseline_ok") and not task.get("unsupported"):
@@ -347,10 +360,10 @@ def main():
                 continue
             repo = os.path.join(base, f"repo-{cond}")
             copy_repo(os.path.join(base, "repo"), repo)
-            decision_config(cond, repo)
+            decision_config(cond, repo, os.path.join(base, f"decision-{cond}"))
             log_path = os.path.join(base, f"agent-{cond}.log")
             start = time.time()
-            code = agent_run(repo, task["problem_statement"], args.timeout_min, log_path, args.agent)
+            code = agent_run(repo, task["problem_statement"], args.timeout_min, log_path, args.agent, args.variant)
             problem = agent_problem(log_path, code)
             if problem == "provider-quota":
                 write_row(results_path, iid, task, cond, None, agent_exit=code, seconds=round(time.time() - start, 1), invalid=problem, log_path=log_path)
@@ -358,7 +371,7 @@ def main():
                 raise SystemExit(2)
             restore_oracle(repo, os.path.join(base, "oracle"), task.get("oracle", []))
             ok, out, err = score(image, repo, task, args.p2p_sample)
-            cov = coverage(repo)
+            cov = coverage(repo, os.path.join(base, f"decision-{cond}"))
             seconds = round(time.time() - start, 1)
             invalid = None
             if cond != "off" and sum(cov.values()) == 0:

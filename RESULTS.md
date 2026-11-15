@@ -54,6 +54,185 @@ timeouts; **no outcome improvement measured yet**. The only apparent failure was
 a harness bug (scoring a Go repo with `python`). Headroom requires harder tasks
 or a weaker model.
 
+## v6 run (2026-11-14, in progress)
+
+First run on the execution-verified dataset (`scripts/gen_dataset_v6.py`).
+
+- Data: `train_m6s.jsonl` = 60k sampled base rows + 36k new rows (SWE-bench-extra,
+  R2E-Gym-Lite, CodeJudgeBench, perturbations, cross-instance). 288,498
+  sequences; noul 156k / score 96k / choice 36k. Canonical state layout.
+- Training: head-only, 1024/256, bf16, 8-bit AdamW, micro-batch 2, grad-accum 8,
+  label smoothing 0.05, from `out-multi`; 1 epoch (18,031 updates).
+- Completed: 15,062.9 s (4.18 h), 19.2 seq/s, avg loss 0.6992, peak 2.16 GB.
+  Checkpoint: `/data/laya-ft/out-m6-head`.
+- Gates: judge dev + `bug_class` accuracy, then the 33-case funnel and the
+  `hard_ood_m6` adversarial slice. Deploy only if it beats `out-multi` on
+  catch/false-pass with no false-alarm regression.
+- Dev (`dev_m6`, n=7,599): `requirements_met` acc 0.771 / bal 0.765 / AUC
+  0.849 / ECE 0.294; `bug_risk` exact 0.178 / MAE 1.173 / ECE 0.228;
+  `bug_class` acc 0.654 (majority `none` = 0.650) / ECE 0.108;
+  `no_unrelated_changes` bal 0.501 / AUC 0.801.
+- OOD (`hard_ood_m6`, n=512): `requirements_met` bal 0.541 / AUC 0.562;
+  `bug_risk` exact 0.004 / MAE 1.458; `bug_class` acc 0.502.
+- Funnel (33-case, pass 0.65, veto 0.5):
+  | model | catch | false pass | false alarm |
+  |---|---|---|---|
+  | out-multi | 21/22 | 1/22 | 6/11 |
+  | out-m5mem4-head | **22/22** | **0/22** | **4/11** |
+  | out-m6-head | 20/22 | 2/22 | 3/11 |
+  Missed slop: unrelated-changes, refactor-beyond-request. False alarms:
+  minimal-fix-good, answer-grounded-good, answer-debug-good.
+
+### v6 verdict (2026-11-15)
+
+**Do not deploy.** m6 improves dev `requirements_met` AUC and `bug_risk`
+exact over base, and lowers false alarms (3 vs 4/6), but it loses one catch and
+adds one false pass against the current `out-m5mem4-head` (20/22, 2 FP vs
+22/22, 0 FP). `bug_class` is at the majority baseline, and `bug_risk` is still
+near-constant. Keep `out-m5mem4-head` as production.
+
+Next levers: hard-negative mining for the two missed scope cases, balanced
+`bug_class` training, and an ordinal/calibrated `bug_risk` head. Starting the
+next run from `out-m5mem4-head` (instead of `out-multi`) is the cheapest way to
+protect catch while adding execution-verified data.
+
+## v7 labels run (2026-11-15, in progress)
+
+`train_v7` (118,496 rows) starts from **out-m5mem4-head** (protect catch),
+head-only, 1024/256, 1 epoch, lr-head 5e-5, label smoothing 0.05, with
+inverse class weights for `bug_class` (capped 10x). Four questions now include
+`no_unrelated_changes`; teacher pairs provide balanced class labels; teacher
+rows keep graded `bug_risk` 1/2/3; scope negatives are explicit.
+
+Gates: dev `bug_class` balanced accuracy/macro, `no_unrelated_changes` balanced
+accuracy/AUC, `bug_risk` exact/MAE, then the 33-case funnel with the four-question
+set (must beat m5mem4's 22/22, 0 FP, 4 FA).
+
+## Weight-Space Programming + calibration spike (2026-11-15)
+
+Read-only diagnostic on the production `out-m5mem4-head`: the final scorer's
+hidden representation separates `bug_risk` 0 vs 3 at **AUC 0.776** (balanced
+200-row dev sample, difference-in-means) and the scorer's `p(level3)` already
+has **AUC 0.773**. The expected score is compressed (means 1.39 / 1.96), so
+`bug_risk` exact is poor even though the signal is present. This is the
+"obstacle hiding an ability" case, so WSP was tested directly.
+
+### WSP edits (`scripts/wsp_probe.py`)
+
+A single rank-1 edit to `scorer.3.weight` along a paired direction
+(`mean(h3 - h0)` or `mean(h | label3) - mean(h | label0)`), sweeping alpha.
+
+| target | best edit | dev probe | verdict |
+|---|---|---|---|
+| `bug_risk` | state3 direction, α=64 | exact 0.064 → **0.502**, MAE 1.34 → **1.13**, AUC 0.690 → 0.690 | bias shift, not capability |
+| `bug_class` | wrong-comparison − none, α=−64 | acc 0.396 → **0.421**, macro 0.122 → 0.125 | no signal |
+
+Funnel for the `bug_risk` edit: **19/22 caught, 3 false pass, 3 false alarm**
+(worse than m5mem4's 22/22, 0 FP, 4 FA). The edit mostly shifts the expected
+score toward level 3; discrimination (AUC) does not improve.
+
+### Calibration / decision-rule edits
+
+| rule | caught | false pass | false alarm |
+|---|---|---|---|
+| m5mem4, expected score (production) | **22/22** | **0/22** | **4/11** |
+| m5mem4, `bug_risk = p(level3)` | 19/22 | 3/22 | 3/11 |
+| m5mem4, `noul` temperature 0.5 | 19/22 | 3/22 | 4/11 |
+| m5mem4, `bug_risk` temperature 1.5 | 22/22 | 0/22 | 5/11 |
+
+### Follow-up: per-option bias and head-only merges
+
+**Per-option bias/prior (m5mem4), dev_v7:**
+
+| target | baseline | best bias | result |
+|---|---|---|---|
+| `bug_class` macro | 0.145 (acc 0.290) | `+0.25·log prior` | macro **0.161**, acc 0.459 |
+| `bug_risk` exact | 0.118 (MAE 1.244) | `+4·log prior` | exact **0.179**, MAE 1.198, p3 0.681 |
+
+The class signal on m5mem4 is too weak for a prior fix; this is the classifier
+example's lesson without the classifier's clean bias.
+
+**Head-only merges with m6** (funnel, 3-question set):
+
+| merge | caught | false pass | false alarm |
+|---|---|---|---|
+| m5mem4 (baseline) | **22/22** | **0/22** | **4/11** |
+| task, α0.1 | 21/22 | 1/22 | 7/11 |
+| task, α0.2/0.3 | 19/22 | 3/22 | 6–7/11 |
+| task, α0.4 | 18/22 | 4/22 | 6/11 |
+| interp, α0.2/0.3 | 22/22 | 0/22 | 8/11, 7/11 |
+| scorer-only, α0.2/0.5 | 22/22 | 0/22 | 5/11 |
+
+No merge improves the operating point. The m6 task vector is destructive;
+interpolation preserves catch but adds false alarms. `v7` (trained from
+m5mem4) remains the only promising merge candidate, and its training was still
+running.
+
+### Verdict
+
+No WSP, calibration, bias, or m6 merge beats the production rule on the funnel. The
+information is present (AUC ~0.69–0.78) but the current expected-score rule is
+already the best catch/false-pass tradeoff; shifting it buys dev exact at the
+cost of real catches. `bug_class` is label-limited (65% `none`), and a head
+direction cannot add the missing classes. This matches the WSP blog's Gemma
+counterexample: weight edits remove obstacles, they do not add abilities.
+
+Keep `out-m5mem4-head`. If WSP is revisited, the next honest test is a linear
+probe direction on a larger balanced set with a held-out test split, not the
+33-case bench. The experimental bench flags live in
+`packages/encoder/script/decision-bench.ts` (`DECISION_BUG_RISK_P3`,
+`DECISION_NOUL_TEMPERATURE`, `DECISION_BUG_RISK_TEMPERATURE`).
+
+## v7 labels run (2026-11-15, in progress)
+
+`scripts/gen_dataset_v7.py` rebuilds the labels around the two failures from v6:
+
+- four-question set: `requirements_met`, `no_unrelated_changes`, `bug_risk`,
+  `bug_class` (scope gets its own head);
+- teacher rows keep graded `bug_risk` 1/2/3; scope rows get
+  `bug_class=scope-unrelated`;
+- teacher preference pairs supply balanced `bug_class` labels from
+  `dimensions.defect` (wrong-comparison, off-by-one, null-empty, type-coercion,
+  resource-leak, swallowed-exception, other);
+- deterministic class mutations and 3,000 synthetic scope negatives;
+- class-weighted `bug_class` loss (weights clamped at 10x);
+- split grouped by task hash; train/dev/test: 118,496 / 8,749 / 8,816.
+- dev `bug_class`: none 1,058, other 210, scope 197, wrong-comparison 169,
+  null-empty 72, off-by-one 66, type-coercion 86, swallowed 46, resource 3.
+
+Training: head-only from `out-m5mem4-head`, 1024, lr-head 5e-5, label smoothing
+0.05, class balance, 1 epoch. Completed in 16,698.6 s, avg loss 0.7748.
+Checkpoint `/data/laya-ft/out-v7-head`.
+
+**v7 results (do not deploy):**
+
+| metric | m5mem4 | v7 |
+|---|---|---|
+| `bug_class` macro (dev) | 0.145 | **0.228** |
+| `bug_class` acc (dev / OOD) | 0.290 / 0.502 | 0.371 / 0.178 |
+| `bug_risk` exact / MAE (dev) | 0.118 / 1.244 | 0.077 / 1.259 |
+| `bug_risk` exact (OOD) | 0.004 | 0.002 |
+| `no_unrelated_changes` bal / AUC | — | **0.508 / 0.646** |
+| `requirements_met` bal / AUC (dev) | ~0.765 / 0.849 | 0.632 / 0.742 |
+| `requirements_met` bal / AUC (OOD) | 0.541 / 0.562 | 0.502 / 0.524 |
+| 4-question funnel | 19/22, 3 FP, 4 FA | 19/22, 3 FP, 5 FA |
+| 3-question funnel | **22/22, 0 FP, 4 FA** | 21/22, 1 FP, 5 FA |
+
+The scope head is at chance because the labels are 88% "unrelated=true"; the
+model predicts true. Adding the fourth question to the runtime also drops
+m5mem4 from 22/22 to 19/22, 3 FP (the extra weight dilutes bug catch), so the
+question set was reverted to three.
+
+### Deterministic scope rule (kept)
+
+A high-precision rule in `verify.ts` flags repo-wide formatters
+(`prettier/eslint/ruff/black/... --write|--fix .`) and bulk mechanical rewrites
+(`rewrote N lines`, `updated N call sites`, `across N files`). On the 3-question
+funnel with m5mem4: **22/22 caught, 0 false pass, 4 false alarm**, deterministic
+catches 15 → 17 (the two scope cases no longer depend on the judge). This is the
+scope fix; the model head was not usable.
+
+
 ## Earlier results (v1-v2)
 
 Every run below starts from the base `convaiinnovations/laya` ("out-multi") and
@@ -111,3 +290,61 @@ synthetic-only retraining.
   three questions) and uses about 2 GB.
 - Bench control reproduces the documented baseline exactly (12/14, false pass
   2/14) on the current evidence-less wire.
+
+## Round 3 - runtime gate hardening (2026-11-15)
+
+The judge is now review-only where it cannot steer safely. Turn-level
+`needs_review` never blocks or retries; only deterministic high-severity
+findings do. Per-tool Laya calls in encoder and dsh are telemetry, not gates.
+`reviewBand` resolves marginal vetoes and near-threshold composites to
+`needs_review(reviewOnly=true)`, and `confidenceFloor` does the same for
+low-confidence answers.
+
+Hard failures stay hard: a severe veto or a composite below
+`passThreshold - reviewBand` is `fail` even when confidence is low. Without
+this, a failing baseline (typeguard) was labelled review-only because its
+answers were uncertain.
+
+Visible5 rerun (`confidenceFloor=0.5`, production checkpoint):
+
+| task | off | veto-turn | terminal |
+|---|---|---|---|
+| yamllint | pass | pass | review-only pass 0.696 |
+| exceptiongroup | pass | pass | review-only pass 0.628 |
+| typeguard | fail | fail | hard fail 0.362 |
+| sqlparse | pass | pass | review-only pass 0.672 |
+| bottle | pass | pass | review-only pass 0.660 |
+| boltons | pass | pass | review-only pass 0.706 |
+
+5/6 match baseline, no false alarms, no timeouts (max 317s). A targeted
+typeguard rerun after the hard-fail fix terminated at 363s with terminal
+`fail` and no review-only flag.
+
+A 20-task hard-set A/B is queued after baseline validation; the first
+`tasks.json` batch was mostly baseline-passing (invalid) instances, so the
+candidate set is now baseline-filtered before the A/B.
+
+Follow-up: a clear pass (`composite >= passThreshold + reviewBand`) is never
+downgraded by low confidence. The dsh profile floor is now 0.2; a 0.807 clear
+pass passes, while a 0.654 margin (+0.004, inside the 0.05 band) remains
+review-only by the band rule, not by confidence. The 0.654 case has
+`bug_risk` confidence 0.047, so lowering the floor to 0.2 would not have
+changed it. Set `layaReviewBand: 0` to make marginal passes gate.
+
+## Localization
+
+Zero-shot hunk ranking (`scripts/localize_hunks.py`, 100 mutation rows) scores
+top1 **0.30**, top2 **0.68**, MRR **0.578**; function-level localization is
+weaker (recall 0.333, top5 0.5). The hunk step is the usable narrowing signal;
+more retrieval work is needed before it can replace a human review step.
+
+`scripts/build_localization.py` previously wrote rows without per-row
+`criteria` and with numeric gold keys (`0/1/2`), so `train_coding.py` skipped
+them. Fixed to emit `hunk-*` criteria and matching gold keys; regenerated
+`loc_{train,dev,test}.jsonl` (1,653 / 220 / 80). No localization fine-tune has
+been run yet.
+
+Runtime test path: dsh-totem `POST /totem/laya/localize` (manual, non-gating)
+accepts `{task, diff}` or `{task, changes}` and returns ranked hunks; verified
+on a two-hunk diff (top 0.5294 vs 0.4706, 254 ms) while the automatic gate was
+off.
