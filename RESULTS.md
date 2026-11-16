@@ -348,3 +348,26 @@ Runtime test path: dsh-totem `POST /totem/laya/localize` (manual, non-gating)
 accepts `{task, diff}` or `{task, changes}` and returns ranked hunks; verified
 on a two-hunk diff (top 0.5294 vs 0.4706, 254 ms) while the automatic gate was
 off.
+
+### A/B: 10 baseline-valid tasks
+
+| condition | pass | mean s | mean steps | review-only | flips |
+|---|---:|---:|---:|---:|---:|
+| off | 8/10 | 139.3 | 0 | 0 | - |
+| veto-turn | 8/10 | 201.8 | 27.8 | 3 | 0 |
+| veto-tool | 8/10 | 182.2 | 27.8 | 2 | 0 |
+
+Failures were hydra and typeguard in every arm; no arm fixed either. The gate
+bought no success and added ~40-60 s per task. Typeguard's veto-turn arm hit
+the 10-minute harness timeout (603 s vs 95.9 s off); its veto-tool arm took
+460 s. No false alarms and no verdict flips. The 20-task candidate file was
+mostly baseline-passing (invalid) instances; only 10 unique tasks were valid
+after baseline filtering.
+
+### Localization head-only fine-tune
+
+Built `out-loc-head` from `out-m5mem4-head` (head-only, 26.5M trainable, 3
+epochs, 1,653 rows, avg loss 1.15). On the same 100-row hunk probe: top1
+**0.28**, top2 **0.68**, MRR **0.572** vs zero-shot 0.30 / 0.68 / 0.578. No
+improvement; reject. Keep zero-shot/manual `POST /totem/laya/localize` and
+treat localization as an aid, not a gate.

@@ -129,6 +129,11 @@ only: never records a decision, never steers, and works while the automatic
 gate is off when the shared server is healthy. `laya_localize` exposes the
 same call to the agent when Laya is enabled.
 
+A 3-epoch head-only fine-tune from `out-m5mem4-head` on the repaired rows
+(`out-loc-head`) scored top1 0.28 / top2 0.68 / MRR 0.572, no better than the
+zero-shot probe (0.30 / 0.68 / 0.578). It is not used; localization remains a
+zero-shot manual narrowing aid.
+
 ## Train
 
 ```sh
