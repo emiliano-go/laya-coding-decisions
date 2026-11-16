@@ -371,3 +371,21 @@ epochs, 1,653 rows, avg loss 1.15). On the same 100-row hunk probe: top1
 **0.28**, top2 **0.68**, MRR **0.572** vs zero-shot 0.30 / 0.68 / 0.578. No
 improvement; reject. Keep zero-shot/manual `POST /totem/laya/localize` and
 treat localization as an aid, not a gate.
+
+### Confirmation: remaining baseline-valid tasks
+
+| condition | pass | mean s | mean steps | flips |
+|---|---:|---:|---:|---:|
+| off | 9/11 | 129.1 | 0 | - |
+| veto-turn | 9/11 | 166.7 | 18.2 | 0 |
+
+Combined with the first A/B: **21 valid Python tasks, 17/21 pass in both
+arms, zero flips, zero false alarms.** Failures were identical (hydra,
+typeguard, cantools, dask). The gate added turns and latency but fixed
+nothing. Three Go repos plus goatcounter were skipped as unsupported; the
+25-task valid pool therefore contains 21 runnable tasks.
+
+**Decision:** stop Laya gate research. Keep the judge advisory/review-only
+(dsh Laya off by default), keep localization as the zero-shot manual
+narrowing endpoint, and do not train further heads on the current labels.
+The remaining work is product/harness value, not gate tuning.
