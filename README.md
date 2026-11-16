@@ -134,6 +134,23 @@ A 3-epoch head-only fine-tune from `out-m5mem4-head` on the repaired rows
 zero-shot probe (0.30 / 0.68 / 0.578). It is not used; localization remains a
 zero-shot manual narrowing aid.
 
+## Harness memory
+
+`scripts/run_swe_smith.py` has an experimental `memory` arm: it seeds three
+non-oracle repo facts with Totem and asks the agent to search memory first. On
+10 tasks it did not change success (8/10 both), made the run slower on 7/10
+tasks, and the agent made no memory tool calls despite the encoder digest
+reading the seeds. Keep memory for durable run recall, not warm-start hints.
+
+`scripts/harness_ledger.py` imports `results.jsonl` rows into a dedicated
+Totem project (`harness:swe` tags, one observation per instance/condition), so
+harness history is searchable with ordinary memory tools:
+
+```sh
+python scripts/harness_ledger.py --ledger /data/laya-ft/harness-ledger \
+  --root /data/laya-ft/swe-smith-memory --root /data/laya-ft/swe-smith-ab-valid
+```
+
 ## Train
 
 ```sh

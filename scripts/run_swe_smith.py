@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -24,6 +25,7 @@ BASE_URL = os.environ.get("DECISION_BASE_URL", "http://127.0.0.1:8765")
 
 CONDITIONS = {
     "off": {"enabled": False},
+    "memory": {"enabled": False},
     "veto-turn": {"enabled": True, "stepChecks": "veto", "stepCadence": "turn"},
     "veto-tool": {"enabled": True, "stepChecks": "veto", "stepCadence": "tool"},
     "veto-both": {"enabled": True, "stepChecks": "veto", "stepCadence": "both"},
@@ -219,7 +221,7 @@ def describe_failure(output):
     return "Fix the failing tests.\n\nBaseline failure output:\n" + tail[-4000:]
 
 
-def write_row(results_path, iid, task, cond, passed, skipped=None, agent_exit=None, seconds=0, cov=None, out="", err="", invalid=None, log_path=None):
+def write_row(results_path, iid, task, cond, passed, skipped=None, agent_exit=None, seconds=0, cov=None, out="", err="", invalid=None, log_path=None, memory=0):
     row = {
         "instance_id": iid,
         "repo": task.get("repo"),
@@ -232,11 +234,49 @@ def write_row(results_path, iid, task, cond, passed, skipped=None, agent_exit=No
         "score_err": err,
         "invalid": invalid,
         "agent_log": log_path,
+        "memory_calls": memory,
     }
     if skipped:
         row["skipped"] = skipped
     with open(results_path, "a") as f:
         f.write(json.dumps(row) + "\n")
+
+
+TOTEM = os.environ.get("TOTEM_BIN") or shutil.which("totem") or os.path.expanduser("~/.local/bin/totem")
+
+
+def memory_calls(log_path):
+    """Count memory tool calls the agent made, for the memory arm's diagnostics."""
+    if not log_path or not os.path.exists(log_path):
+        return 0
+    text = open(log_path, errors="replace").read()
+    return len(re.findall(r"\bmemory_(?:search|get|create|list|recent|tasks|commands|relate|context|recall_sessions|eval)\b", text))
+
+
+def seed_memory(repo, task):
+    """Seed non-oracle repo facts into Totem; never include the task patch or tests."""
+    if not os.path.exists(TOTEM):
+        print("  memory: totem binary not found; skipping seed", flush=True)
+        return
+    shutil.rmtree(os.path.join(repo, ".totem"), ignore_errors=True)
+    run([TOTEM, "--project", repo, "init"])
+    base = str(task.get("repo", "")).split("/")[-1]
+    entries = [name for name in sorted(os.listdir(repo)) if name not in (".git", ".totem")][:12]
+    has_pytest = any(os.path.exists(os.path.join(repo, name)) for name in (
+        "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini",
+    ))
+    memories = [
+        ("Repository", f"{base} is a Python repository; treat the working tree as the project root.", f"harness:seed,repo:{base}"),
+        ("Test command", "Run the Python test suite with `python -m pytest -q` from the repository root." if has_pytest else "Run the repository's Python test suite from the working tree.", f"harness:seed,cmd:pytest,repo:{base}"),
+        ("Layout", "Top-level entries: " + ", ".join(entries) + ".", f"harness:seed,layout,repo:{base}"),
+    ]
+    for title, statement, tags in memories:
+        proc = run([TOTEM, "--project", repo, "create", "--type", "observation", "--title", title,
+             "--statement", statement, "--tags", tags, "--asserted-by", "source", "--confidence", "0.9",
+             "--metadata", '{"observation": "repo fact"}'])
+        if proc.returncode != 0:
+            print(f"  memory: seed failed for {title}: {proc.stderr.strip()[:200]}", flush=True)
+    print(f"  memory: seeded {len(memories)} repo facts", flush=True)
 
 
 def coverage(repo, artifact_dir=None):
@@ -360,10 +400,20 @@ def main():
                 continue
             repo = os.path.join(base, f"repo-{cond}")
             copy_repo(os.path.join(base, "repo"), repo)
+            shutil.rmtree(os.path.join(repo, ".totem"), ignore_errors=True)
             decision_config(cond, repo, os.path.join(base, f"decision-{cond}"))
+            if cond == "memory":
+                seed_memory(repo, task)
             log_path = os.path.join(base, f"agent-{cond}.log")
+            prompt = task["problem_statement"]
+            if cond == "memory":
+                prompt = (
+                    "Before exploring the repository, search project memory with memory_search for "
+                    "repository facts and test commands; use what is recorded to avoid rediscovery.\n\n"
+                    + prompt
+                )
             start = time.time()
-            code = agent_run(repo, task["problem_statement"], args.timeout_min, log_path, args.agent, args.variant)
+            code = agent_run(repo, prompt, args.timeout_min, log_path, args.agent, args.variant)
             problem = agent_problem(log_path, code)
             if problem == "provider-quota":
                 write_row(results_path, iid, task, cond, None, agent_exit=code, seconds=round(time.time() - start, 1), invalid=problem, log_path=log_path)
@@ -372,14 +422,15 @@ def main():
             restore_oracle(repo, os.path.join(base, "oracle"), task.get("oracle", []))
             ok, out, err = score(image, repo, task, args.p2p_sample)
             cov = coverage(repo, os.path.join(base, f"decision-{cond}"))
+            mem = memory_calls(log_path)
             seconds = round(time.time() - start, 1)
             invalid = None
-            if cond != "off" and sum(cov.values()) == 0:
+            if CONDITIONS[cond].get("enabled", False) and sum(cov.values()) == 0:
                 invalid = "no-decision-eval"
             elif code not in (0, 124):
                 invalid = f"agent-exit-{code}"
-            write_row(results_path, iid, task, cond, ok, agent_exit=code, seconds=seconds, cov=cov, out=out, err=err, invalid=invalid, log_path=log_path)
-            print(f"  {cond}: passed={ok} agent_exit={code} step={cov['step']} term={cov['mutation'] + cov['answer']} invalid={invalid} ({seconds}s)", flush=True)
+            write_row(results_path, iid, task, cond, ok, agent_exit=code, seconds=seconds, cov=cov, out=out, err=err, invalid=invalid, log_path=log_path, memory=mem)
+            print(f"  {cond}: passed={ok} agent_exit={code} step={cov['step']} term={cov['mutation'] + cov['answer']} memory={mem} invalid={invalid} ({seconds}s)", flush=True)
             if invalid and os.path.exists(log_path):
                 print("  agent log tail:", "".join(open(log_path, errors="replace").readlines()[-6:]).strip()[:400], flush=True)
         if args.remove_images:

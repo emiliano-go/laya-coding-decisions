@@ -389,3 +389,19 @@ nothing. Three Go repos plus goatcounter were skipped as unsupported; the
 (dsh Laya off by default), keep localization as the zero-shot manual
 narrowing endpoint, and do not train further heads on the current labels.
 The remaining work is product/harness value, not gate tuning.
+
+### Memory warm-start A/B (2026-11-16)
+
+Seeded three non-oracle repo facts per memory arm via Totem (repo type, test
+command, top-level layout); the agent runs with a memory-first prompt hint and
+the judge is off in both arms.
+
+| condition | pass | mean s | memory calls | flips |
+|---|---:|---:|---:|---:|
+| off | 8/10 | 163.1 | 0 | - |
+| memory | 8/10 | 185.7 | 0 | 0 |
+
+The seed was readable by encoder `digest()` (3 memories), but the agent made no
+memory tool calls and the arm was slower on 7/10 tasks. No success or step gain;
+reject seeded runtime facts as a harness lever. Memory is better used as a
+durable run ledger / recall surface than as a warm-start hint.
