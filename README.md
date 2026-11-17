@@ -4,13 +4,15 @@ Train **Laya** into a judge for coding-agent turns: given a task and a patch,
 score `requirements_met` and `bug_risk`. Built for the encoder / hestia decision
 engine, which posts a strict state to `POST /v1/systemone`.
 
-> **Status (2026-11):** research recipe; published weights are not ready. Two
-> results frame the work: (1) the original `gold` cache was mislabeled
-> (SWE-smith's `patch` is the *breaking* patch), now rebuilt as `gold_fixed`;
-> (2) no trained judge beats the base `convaiinnovations/laya` on the
-> out-of-distribution funnel, and a model trained to read memory invariants does
-> not learn the task. The reliable gains are a deterministic verify lane plus a
-> calibrated decision rule. See `RESULTS.md`.
+> **Status (2026-11-16): closed.** After eight rounds — gate A/B, head-only
+> fine-tunes, memory warm start, hunk and repo localization, call-shape and
+> checkpoint sweeps, hierarchical narrowing, and N-best patch selection — Laya
+> has **no measured role inside a coding agent**. The only capability that
+> survived is a binary `requirements_met` judgement plus a deterministic verify
+> lane, and a binary judgement cannot rank candidates. The durable artifacts are
+> the evaluation harness and the negative record, not a deployed judge.
+> Start with [`docs/CONCLUSIONS.md`](docs/CONCLUSIONS.md); raw rounds are in
+> `RESULTS.md`.
 
 ## Layout
 

@@ -405,3 +405,73 @@ The seed was readable by encoder `digest()` (3 memories), but the agent made no
 memory tool calls and the arm was slower on 7/10 tasks. No success or step gain;
 reject seeded runtime facts as a harness lever. Memory is better used as a
 durable run ledger / recall surface than as a warm-start hint.
+
+## Failure-driven localization (2026-11-16)
+
+Asked Laya where a bug is *after a test failure*: repo-wide function candidates,
+failing pytest output as the state, gold = the function containing the injected
+SWE-smith bug. 21 Python instances, 34 gold sites, zero-shot, no training.
+Full record: `docs/failure-localization.md`.
+
+| config | top1 | top3 | MRR |
+|---|---:|---:|---:|
+| Laya, task + failure | 0.235 | 0.471 | 0.390 |
+| H3 deterministic shortlist order | 0.176 | 0.412 | 0.340 |
+| H1 innermost source frame | 0.176 | 0.412 | 0.340 |
+| H2 BM25 only | 0.147 | 0.382 | 0.306 |
+| task text only (old issue probe) | 0.147 | 0.294 | 0.284 |
+
+Laya is consistently ahead but the paired bootstrap CI for `L − H3` on MRR is
+[−0.023, 0.185]: not separated from zero at n=21. In the assertion-only stratum,
+where the traceback gives nothing, Laya ties the deterministic order exactly
+(0.214 vs 0.214).
+
+Retrieval is the binding constraint, not ranking: R@12 is 0.647 (`k=16`: 0.676).
+Eight of the twelve missed gold sites are in files that never appear in any
+traceback frame — a pytest failure carries no signal for them. Conditional on the
+answer being in the shortlist, Laya wins 3 instances, loses 1, ties 17 vs H3
+(sign test p=0.31).
+
+**Decision:** the retrieval gate (R@12 ≥ 0.85) fails, so the route/tool/UI work
+was not built. This is the fourth independent negative for Laya as a signal source
+(gate A/B 17/21 flat, loc head-only fine-tune flat, memory warm start flat,
+failure localization not separable). Keep `POST /totem/laya/localize` as the
+manual diff-narrowing aid; keep the gate off by default. Do not invest further in
+autonomous or semi-autonomous localization.
+
+### Call-shape follow-up (2026-11-16)
+
+Tested whether asking differently recovers signal: short labels, code snippets as
+options, per-candidate `noul` scoring, pairwise + Bradley-Terry, and the other two
+checkpoints. Nothing beats the original 12-way choice (top1 0.235 / MRR 0.385 vs
+deterministic 0.176 / 0.340). Short labels are identical (0.235), pointwise is
+0.088, pairwise at k=8 is 0.147 against a 0.176 control, `typed-decisions` ties
+english, `multilingual` collapses to 0.059. The shared-option-budget hypothesis
+is falsified: the model was not being starved of evidence. What remains is
+retrieval (coverage / import graph) and more instances, neither of which is a
+Laya change. Details in `docs/failure-localization.md`.
+
+### Hierarchical narrowing (2026-11-16)
+
+The dir → file → section → function cascade was never implemented; it existed
+only as a proposal. Implemented and tested against the same corpus: pure cascade
+top1 **0.000** / MRR 0.128, hybrid (cascade to 3 files, then in-file ranking)
+top1 0.029 / MRR 0.112, both far below the deterministic flat shortlist
+(0.176 / 0.340) and the single 12-way choice (0.235 / 0.385). File-level top1 is
+0.190 and the in-file ranking only wins 1 in 4 when the file is right; the
+cascade gravitates to build scripts and tooling modules named in the failure
+text. Reject the hierarchy: the coarse stage must be a better retriever than
+BM25, and Laya is not one.
+
+### N-best patch selection (2026-11-16)
+
+Tested the last shape where a "catches bugs" capability would change an outcome:
+choosing among candidate patches. SWE-Rebench was already on disk (6,291 tasks,
+4,808 with 4-12 execution-labelled candidates, base rate ~0.46). Laya's pick is
+at chance in every setup — 0.465 vs 0.482 over 600 tasks, 0.657 vs 0.665 over
+201 four-candidate tasks with richer options, 0.633 vs 0.654 pointwise. The
+probability mass on correct candidates equals the base rate, i.e. a uniform
+distribution over the candidates. Also worth recording: the old funnel's 12/14
+catch came from `requirements_met` plus the deterministic verify lane, not from
+`bug_risk`; a binary requirement check cannot order candidates, which is what
+these uniform distributions demonstrate.
