@@ -475,3 +475,26 @@ distribution over the candidates. Also worth recording: the old funnel's 12/14
 catch came from `requirements_met` plus the deterministic verify lane, not from
 `bug_risk`; a binary requirement check cannot order candidates, which is what
 these uniform distributions demonstrate.
+
+## Memory type classification (2026-11-16)
+
+Task 1 of the memory plan: can Laya assign a memory's type (8 classes) better
+than a cheap neighbour classifier? Corpus: 490 active memories over 9 projects;
+81 rows carried a type name in their tags (stripped), 3 had it in the title.
+
+| predictor (in-project LOO) | accuracy | macro-F1 |
+|---|---:|---:|
+| majority | 0.755 | 0.205 |
+| TF-IDF kNN (k=5) | 0.788 | 0.439 |
+| potion-retrieval-32M kNN (k=5) | 0.773 | 0.446 |
+| **Laya, 8-way choice** | **0.549** | **0.224** |
+
+Cross-project is the same story (0.484 / 0.500 / 0.224). Laya never predicts
+`decision` or `contract`, catches 2% of `gotcha`, and is below the global
+majority on accuracy. The bar was best-baseline + 0.10 at ≥ 0.55; the gap to the
+embedding kNN is −0.222.
+
+**Decision:** reject. If type suggestions are ever wanted, use the embedding
+kNN. Task 2 (contradictions) remains blocked: there are 4 recorded conflicts in
+the whole local history, so it cannot be evaluated until ~100 pairs are
+adjudicated.

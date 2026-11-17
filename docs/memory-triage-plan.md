@@ -1,6 +1,8 @@
 # Memory triage with Laya — plan
 
-Status: **planned**, not started. 2026-11-16.
+Status: **Task 1 run and failed** (2026-11-16, results in
+[`memory-type-results.md`](memory-type-results.md): Laya 0.224 macro-F1 vs 0.446
+for the embedding kNN). **Task 2 is blocked on labels.**
 Prerequisite reading: [`CONCLUSIONS.md`](CONCLUSIONS.md) — the rule this plan
 follows is that a Laya experiment needs a closed label set, a labeled corpus,
 and a baseline it must beat *before* it runs.
